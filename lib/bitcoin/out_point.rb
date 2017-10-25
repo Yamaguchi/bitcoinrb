@@ -9,7 +9,7 @@ module Bitcoin
     attr_reader :hash
     attr_reader :index
 
-    def initialize(hash, index)
+    def initialize(hash, index = -1)
       @hash = hash
       @index = index
     end
@@ -20,6 +20,14 @@ module Bitcoin
 
     def to_payload
       [hash.htb.reverse, index].pack('a32V')
+    end
+
+    def self.create_coinbase_outpoint
+      new(COINBASE_HASH, COINBASE_INDEX)
+    end
+
+    def valid?
+      index >= 0 && (!coinbase? && hash != COINBASE_HASH)
     end
 
   end
