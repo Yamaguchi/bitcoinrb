@@ -4,34 +4,10 @@ module Bitcoin
   class Script
     include Bitcoin::Opcodes
 
-    # witness version
-    WITNESS_VERSION = 0x00
-
-    # Maximum script length in bytes
-    MAX_SCRIPT_SIZE = 10000
-
-    # Maximum number of public keys per multisig
-    MAX_PUBKEYS_PER_MULTISIG = 20
-
-    # Maximum number of non-push operations per script
-    MAX_OPS_PER_SCRIPT = 201
-
-    # Maximum number of bytes pushable to the stack
-    MAX_SCRIPT_ELEMENT_SIZE = 520
-
-    # Threshold for nLockTime: below this value it is interpreted as block number, otherwise as UNIX timestamp.
-    LOCKTIME_THRESHOLD = 500000000
-
-    # Signature hash types/flags
-    SIGHASH_TYPE = { all: 1, none: 2, single: 3, anyonecanpay: 128 }
-
-    # Maximum number length in bytes
-    DEFAULT_MAX_NUM_SIZE = 4
-
     attr_accessor :chunks
 
-    def initialize
-      @chunks = []
+    def initialize(input_script=nil)
+      @chunks = parse(input_script)
     end
 
     # generate P2PKH script
@@ -50,8 +26,17 @@ module Bitcoin
     # @return [Script, Script] first element is p2sh script, second one is redeem script.
     def self.to_p2sh_multisig_script(m, pubkeys)
       redeem_script = to_multisig_script(m, pubkeys)
-      p2sh_script = new << OP_HASH160 << redeem_script.to_hash160 << OP_EQUAL
-      [p2sh_script, redeem_script]
+      [redeem_script.to_p2sh, redeem_script]
+    end
+
+    # generate p2sh script with this as a redeem script
+    # @return [Script] P2SH script
+    def to_p2sh
+      Script.new << OP_HASH160 << to_hash160 << OP_EQUAL
+    end
+
+    def get_multisig_pubkeys
+      1.upto(@chunks[-2] - 80).map{|i| @chunks[i] }
     end
 
     # generate m of n multisig script
@@ -61,6 +46,7 @@ module Bitcoin
     def self.to_multisig_script(m, pubkeys)
       new << m << pubkeys << pubkeys.size << OP_CHECKMULTISIG
     end
+
 
     # generate p2wsh script for +redeem_script+
     # @param [Script] redeem_script target redeem script
@@ -90,17 +76,27 @@ module Bitcoin
         opcode = buf.read(1)
         if opcode.pushdata?
           pushcode = opcode.ord
+          packed_size = nil
           len = case pushcode
                   when OP_PUSHDATA1
-                    buf.read(1)
+                    packed_size = buf.read(1)
+                    packed_size.unpack('C').first
                   when OP_PUSHDATA2
-                    buf.read(2)
+                    packed_size = buf.read(2)
+                    packed_size.unpack('v').first
                   when OP_PUSHDATA4
-                    buf.read(4)
+                    packed_size = buf.read(4)
+                    packed_size.unpack('V').first
                   else
                     pushcode if pushcode < OP_PUSHDATA1
                 end
-          s << buf.read(len).bth if len
+          if len
+            s.chunks << [len].pack('C') if buf.eof?
+            unless buf.eof?
+              chunk = (packed_size ? (opcode + packed_size) : (opcode)) + buf.read(len)
+              s.chunks << chunk
+            end
+          end
         else
           s << opcode.ord
         end
@@ -112,11 +108,19 @@ module Bitcoin
       chunks.join
     end
 
+    def to_hex
+      to_payload.bth
+    end
+
     def to_addr
       return p2pkh_addr if p2pkh?
-      return p2wpkh_addr if p2wpkh?
-      return p2wsh_addr if p2wsh?
       return p2sh_addr if p2sh?
+      return bech32_addr if witness_program?
+    end
+
+    # check whether standard script.
+    def standard?
+      p2pkh? | p2sh? | p2wpkh? | p2wsh? | multisig? | standard_op_return?
     end
 
     # whether this script is a P2PKH format script.
@@ -142,29 +146,100 @@ module Bitcoin
       OP_HASH160 == chunks[0].ord && OP_EQUAL == chunks[2].ord && chunks[1].bytesize == 21
     end
 
+    def multisig?
+      return false if chunks.size < 4 || chunks.last.ord != OP_CHECKMULTISIG
+      pubkey_count = Opcodes.opcode_to_small_int(chunks[-2].opcode)
+      sig_count = Opcodes.opcode_to_small_int(chunks[0].opcode)
+      return false unless pubkey_count || sig_count
+      sig_count < pubkey_count
+    end
+
+    def op_return?
+      chunks.size >= 1 && chunks[0].ord == OP_RETURN
+    end
+
+    def standard_op_return?
+      op_return? && size <= MAX_OP_RETURN_RELAY &&
+          (chunks.size == 1 || chunks[1].opcode <= OP_16)
+    end
+
+    def op_return_data
+      return nil unless op_return?
+      chunks[1].pushed_data
+    end
+
     # whether data push only script which dose not include other opcode
-    def data_only?
+    def push_only?
       chunks.each do |c|
         return false if !c.opcode.nil? && c.opcode > OP_16
       end
       true
     end
 
-    # whether this script has witness program.
+    # A witness program is any valid Script that consists of a 1-byte push opcode followed by a data push between 2 and 40 bytes.
     def witness_program?
-      p2wpkh? || p2wsh?
+      return false if size < 4 || size > 42 || chunks.size < 2
+
+      opcode = chunks[0].opcode
+
+      return false if opcode != OP_0 && (opcode < OP_1 || opcode > OP_16)
+      return false unless chunks[1].pushdata?
+
+      if size == (chunks[1][0].unpack('C').first + 2)
+        program_size = chunks[1].pushed_data.bytesize
+        return program_size >= 2 && program_size <= 40
+      end
+
+      false
+    end
+
+    # get witness commitment
+    def witness_commitment
+      return nil if !op_return? || op_return_data.bytesize < 36
+      buf = StringIO.new(op_return_data)
+      return nil unless buf.read(4).bth == WITNESS_COMMITMENT_HEADER
+      buf.read(32).bth
+    end
+
+    # If this script is witness program, return its script code,
+    # otherwise returns the self payload. ScriptInterpreter does not use this.
+    def to_script_code(skip_separator_index = 0)
+      payload = to_payload
+      if p2wpkh?
+        payload = Script.to_p2pkh(chunks[1].pushed_data.bth).to_payload
+      elsif skip_separator_index > 0
+        payload = subscript_codeseparator(skip_separator_index)
+      end
+      Bitcoin.pack_var_string(payload)
+    end
+
+    # get witness version and witness program
+    def witness_data
+      version = opcode_to_small_int(chunks[0].opcode)
+      program = chunks[1].pushed_data
+      [version, program]
     end
 
     # append object to payload
     def <<(obj)
       if obj.is_a?(Integer)
-        append_opcode(obj)
+        push_int(obj)
       elsif obj.is_a?(String)
         append_data(obj.b)
       elsif obj.is_a?(Array)
         obj.each { |o| self.<< o}
         self
       end
+    end
+
+    # push integer to stack.
+    def push_int(n)
+      begin
+        append_opcode(n)
+      rescue ArgumentError
+        append_data(Script.encode_number(n))
+      end
+      self
     end
 
     # append opcode to payload
@@ -181,30 +256,22 @@ module Bitcoin
     # @param [String] data append data. this data is not binary
     # @return [Script] return self
     def append_data(data)
-      data = data.htb
-      size = data.bytesize
-      header = if size < OP_PUSHDATA1
-                 [size].pack('C')
-               elsif size < 0xff
-                 [OP_PUSHDATA1, size].pack('CC')
-               elsif size < 0xffff
-                 [OP_PUSHDATA2, size].pack('Cv')
-               elsif size < 0xffffffff
-                 [OP_PUSHDATA4, size].pack('CV')
-               else
-                 raise ArgumentError, 'data size is too big.'
-               end
-      chunks << (header + data)
+      chunks << Bitcoin::Script.pack_pushdata(data.htb)
       self
     end
 
     def to_s
       chunks.map { |c|
-        if c.pushdata?
-          v = Opcodes.opcode_to_small_int(c.ord)
-          v ? v : c.pushed_data.bth
-        else
-          Opcodes.opcode_to_name(c.ord)
+        case c
+        when Fixnum
+          opcode_to_name(c)
+        when String
+          if c.pushdata?
+            v = Opcodes.opcode_to_small_int(c.ord)
+            v ? v : c.pushed_data.bth
+          else
+            Opcodes.opcode_to_name(c.ord)
+          end
         end
       }.join(' ')
     end
@@ -256,6 +323,23 @@ module Bitcoin
       result
     end
 
+    # binary +data+ convert pushdata which contains data length and append PUSHDATA opcode if necessary.
+    def self.pack_pushdata(data)
+      size = data.bytesize
+      header = if size < OP_PUSHDATA1
+                 [size].pack('C')
+               elsif size < 0xff
+                 [OP_PUSHDATA1, size].pack('CC')
+               elsif size < 0xffff
+                 [OP_PUSHDATA2, size].pack('Cv')
+               elsif size < 0xffffffff
+                 [OP_PUSHDATA4, size].pack('CV')
+               else
+                 raise ArgumentError, 'data size is too big.'
+               end
+      header + data
+    end
+
     # subscript this script to the specified range.
     def subscript(*args)
       s = self.class.new
@@ -266,8 +350,54 @@ module Bitcoin
     # removes chunks matching subscript byte-for-byte and returns as a new object.
     def find_and_delete(subscript)
       raise ArgumentError, 'subscript must be Bitcoin::Script' unless subscript.is_a?(Script)
-      diff = to_payload.bth.gsub(subscript.to_payload.bth, '')
-      Script.parse_from_payload(diff.htb)
+      return self if subscript.chunks.empty?
+      buf = []
+      i = 0
+      result = Script.new
+      chunks.each do |chunk|
+        sub_chunk = subscript.chunks[i]
+        if chunk.start_with?(sub_chunk)
+          if chunk == sub_chunk
+            buf << chunk
+            i += 1
+            (i = 0; buf.clear) if i == subscript.chunks.size # matched the whole subscript
+          else # matched the part of head
+            i = 0
+            tmp = chunk.dup
+            tmp.slice!(sub_chunk)
+            result.chunks << tmp
+          end
+        else
+          result.chunks << buf.join unless buf.empty?
+          if buf.first == chunk
+            i = 1
+            buf = [chunk]
+          else
+            i = 0
+            result.chunks << chunk
+          end
+        end
+      end
+      result
+    end
+
+    # remove all occurences of opcode. Typically it's OP_CODESEPARATOR.
+    def delete_opcode(opcode)
+      @chunks = chunks.select{|chunk| chunk.ord != opcode}
+      self
+    end
+
+    # Returns a script that deleted the script before the index specified by separator_index.
+    def subscript_codeseparator(separator_index)
+      buf = []
+      process_separator_index = 0
+      chunks.each{|chunk|
+        buf << chunk if process_separator_index == separator_index
+        if chunk.ord == OP_CODESEPARATOR && process_separator_index < separator_index
+          process_separator_index += 1
+        end
+      }
+      buf.join
     end
 
     def ==(other)
@@ -276,6 +406,52 @@ module Bitcoin
     end
 
     private
+
+    # parse raw script
+    def parse(input_script)
+      return [] unless input_script
+      program = input_script.unpack("C*")
+      chunks = []
+      until program.empty?
+        opcode = program.shift
+
+        if (opcode > 0) && (opcode < OP_PUSHDATA1)
+          len, tmp = opcode, program[0]
+          chunks << program.shift(len).pack("C*")
+
+          # 0x16 = 22 due to OP_2_16 from_string parsing
+          if len != 1 || !tmp || !tmp <= 22
+            raise "invalid OP_PUSHDATA0" if len != chunks.last.bytesize
+          end
+        elsif (opcode == OP_PUSHDATA1)
+          len = program.shift(1)[0]
+          chunks << program.shift(len).pack("C*")
+
+          if len <= OP_PUSHDATA1 || len > 0xff
+            raise "invalid OP_PUSHDATA1" if len != chunks.last.bytesize
+          end
+        elsif (opcode == OP_PUSHDATA2)
+          len = program.shift(2).pack("C*").unpack("v")[0]
+          chunks << program.shift(len).pack("C*")
+
+          if len <= 0xff || len > 0xffff
+            raise "invalid OP_PUSHDATA2" if len != chunks.last.bytesize
+          end
+        elsif (opcode == OP_PUSHDATA4)
+          len = program.shift(4).pack("C*").unpack("V")[0]
+          chunks << program.shift(len).pack("C*")
+
+          if len <= 0xffff
+            raise "invalid OP_PUSHDATA4" if len != chunks.last.bytesize
+          end
+        else
+          chunks << opcode
+        end
+      end
+      chunks
+    rescue => ex
+      []
+    end
 
     # generate p2pkh address. if script dose not p2pkh, return nil.
     def p2pkh_addr

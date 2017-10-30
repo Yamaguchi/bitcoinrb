@@ -3,6 +3,8 @@ module Bitcoin
   # transaction output
   class TxOut
 
+    include OpenAssets::MarkerOutput
+
     attr_accessor :value
     attr_accessor :script_pubkey
 
@@ -13,7 +15,7 @@ module Bitcoin
 
     def self.parse_from_payload(payload)
       buf = payload.is_a?(String) ? StringIO.new(payload) : payload
-      value = buf.read(8).unpack('Q').first
+      value = buf.read(8).unpack('q').first
       script_size = Bitcoin.unpack_var_int_from_io(buf)
       new(value: value, script_pubkey: Script.parse_from_payload(buf.read(script_size)))
     end

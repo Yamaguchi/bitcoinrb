@@ -4,17 +4,20 @@ require 'ecdsa'
 require 'securerandom'
 require 'json'
 require 'bech32'
+require 'ffi'
+require_relative 'openassets'
 
 module Bitcoin
 
   autoload :Util, 'bitcoin/util'
   autoload :ChainParams, 'bitcoin/chain_params'
   autoload :Message, 'bitcoin/message'
-  autoload :Connection, 'bitcoin/connection'
   autoload :Logger, 'bitcoin/logger'
+  autoload :Block, 'bitcoin/block'
   autoload :BlockHeader, 'bitcoin/block_header'
   autoload :Tx, 'bitcoin/tx'
   autoload :Script, 'bitcoin/script/script'
+  autoload :Multisig, 'bitcoin/script/multisig'
   autoload :ScriptInterpreter, 'bitcoin/script/script_interpreter'
   autoload :ScriptError, 'bitcoin/script/script_error'
   autoload :TxChecker, 'bitcoin/script/tx_checker'
@@ -26,10 +29,16 @@ module Bitcoin
   autoload :Key, 'bitcoin/key'
   autoload :ExtKey, 'bitcoin/ext_key'
   autoload :Opcodes, 'bitcoin/opcodes'
-  autoload :Node, 'bitcoin/nodes'
+  autoload :Node, 'bitcoin/node'
   autoload :Base58, 'bitcoin/base58'
   autoload :Secp256k1, 'bitcoin/secp256k1'
   autoload :Mnemonic, 'bitcoin/mnemonic'
+  autoload :ValidationState, 'bitcoin/validation'
+  autoload :Network, 'bitcoin/network'
+  autoload :Store, 'bitcoin/store'
+  autoload :RPC, 'bitcoin/rpc'
+
+  require_relative 'bitcoin/constants'
 
   extend Util
 
@@ -57,7 +66,7 @@ module Bitcoin
 
   # base dir path that store blockchain data and wallet data
   def self.base_dir
-    "#{Dir.home}/.bitcoinrb"
+    "#{Dir.home}/.bitcoinrb/#{@chain_param}"
   end
 
   # get secp implementation module
@@ -93,9 +102,13 @@ module Bitcoin
       !pushdata?
     end
 
+    def push_opcode?
+      [Bitcoin::Opcodes::OP_PUSHDATA1, Bitcoin::Opcodes::OP_PUSHDATA2, Bitcoin::Opcodes::OP_PUSHDATA4].include?(opcode)
+    end
+
     # whether data push only?
     def pushdata?
-      opcode <= Bitcoin::Opcodes::OP_PUSHDATA4
+      opcode <= Bitcoin::Opcodes::OP_PUSHDATA4 && opcode > Bitcoin::Opcodes::OP_0
     end
 
     def pushed_data
@@ -110,6 +123,31 @@ module Bitcoin
         offset += 4
       end
       self[offset..-1]
+    end
+
+  end
+
+  class ::Object
+
+    def build_json
+      if self.is_a?(Array)
+        "[#{self.map{|o|o.to_h.to_json}.join(',')}]"
+      else
+        to_h.to_json
+      end
+    end
+
+    def to_h
+      instance_variables.inject({}) do |result, var|
+        key = var.to_s
+        key.slice!(0) if key.start_with?('@')
+        value = instance_variable_get(var)
+        if value.is_a?(Array)
+          result.update(key => value.map{|v|v.to_h})
+        else
+          result.update(key => value)
+        end
+      end
     end
 
   end
